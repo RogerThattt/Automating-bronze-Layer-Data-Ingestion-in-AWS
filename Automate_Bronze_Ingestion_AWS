@@ -1,0 +1,85 @@
+# Databricks notebook name: Automate_Bronze_Ingestion_AWS
+# Description: Metadata-driven Bronze Layer Data Ingestion using AWS S3 + Delta + Secrets Manager
+# Author: OpenAI (Generated)
+
+# COMMAND ----------
+
+# 📦 Step 3.1: Import required libraries
+import json
+from datetime import datetime, timedelta
+from pyspark.sql.functions import col, input_file_name, lit
+
+# COMMAND ----------
+
+# 🔐 Step 3.2: Get AWS credentials securely from Databricks Secret Scope
+access_key = dbutils.secrets.get(scope="aws_secrets", key="s3-access-key-id")
+secret_key = dbutils.secrets.get(scope="aws_secrets", key="s3-secret-access-key")
+
+# Set Hadoop S3A configuration
+spark._jsc.hadoopConfiguration().set("fs.s3a.access.key", access_key)
+spark._jsc.hadoopConfiguration().set("fs.s3a.secret.key", secret_key)
+spark._jsc.hadoopConfiguration().set("fs.s3a.endpoint", "s3.amazonaws.com")
+
+# COMMAND ----------
+
+# 📄 Step 3.3: Load Metadata Configuration Table
+config_df = spark.read.table("config")
+config_list = config_df.collect()
+
+# COMMAND ----------
+
+# 📆 Step 3.4: Set Ingestion Date = Yesterday (T-1)
+yesterday = datetime.now() - timedelta(days=1)
+year, month, day = yesterday.strftime("%Y"), yesterday.strftime("%m"), yesterday.strftime("%d")
+
+# COMMAND ----------
+
+# 🔁 Step 3.5: Loop through each metadata config and ingest data
+for row in config_list:
+    source_meta = json.loads(row["source_object"])
+    dest_meta = json.loads(row["destination_object"])
+
+    # Construct file path using metadata and T-1 date
+    file_name = source_meta["file_name_pattern"].format(YYYY=year, MM=month, DD=day)
+    file_path = f"s3a://{source_meta['source_bucket']}/{source_meta['source_prefix']}/{year}/{month}/{file_name}"
+    print(f"📥 Processing file: {file_path}")
+
+    try:
+        # Load CSV file with header
+        df = spark.read.option("header", "true").csv(file_path)
+
+        # Apply schema based on metadata
+        for col_meta in source_meta["columns"]:
+            col_name = col_meta["column_name"]
+            data_type = col_meta["data_type"]
+            df = df.withColumnRenamed(col_name, col_name.lower())
+            df = df.withColumn(col_name.lower(), col(col_name.lower()).cast(data_type))
+
+        # Add audit columns
+        df = df.withColumn("ingestion_date", lit(datetime.now().strftime("%Y-%m-%d")))
+        df = df.withColumn("source_file", input_file_name())
+
+        # Write to Delta format in Bronze layer
+        destination_path = dest_meta["destination_path"]
+        (
+            df.write.format("delta")
+            .mode("overwrite")  # Use 'append' for production
+            .save(destination_path)
+        )
+
+        print(f"✅ Written to Bronze Delta: {destination_path}")
+
+    except Exception as e:
+        print(f"❌ Failed to process {file_path}: {str(e)}")
+
+# COMMAND ----------
+
+# 🧪 Step 4.1: Sample validation query
+# You can replace 'agents' with 'products', etc.
+df_sample = spark.read.format("delta").load("s3a://company-data-lake/bronze/agents")
+display(df_sample.limit(10))
+
+# COMMAND ----------
+
+# 📋 Step 4.2: Describe schema of Delta table
+spark.sql("DESCRIBE DETAIL delta.`s3a://company-data-lake/bronze/agents`").show(truncate=False)
